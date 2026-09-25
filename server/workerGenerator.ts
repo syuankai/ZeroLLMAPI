@@ -446,6 +446,16 @@ npm run dev
 # 3. 部署至 Cloudflare 邊緣網路
 npm run deploy
 \`\`\`
+
+---
+
+## 🛠️ 常見建置錯誤排除 (Troubleshooting)
+
+### Q: 出現 \`Unknown lockfile version: failed to parse lockfile: 'bun.lock'\`？
+* **原因**：CI / Cloudflare Builds 偵測到 \`bun.lock\` 檔，嘗試用環境舊版 Bun 執行 \`bun install --frozen-lockfile\` 導致格式不支援。
+* **解法**：
+  1. 於倉庫中刪除 \`bun.lock\`：\`git rm bun.lock && git commit -m "fix: remove bun.lock" && git push\`
+  2. 確保建置命令使用 \`npm install\` 與 \`npx wrangler deploy\`。
 `;
 
   return { workerTs, wranglerToml, devVars, githubWorkflow, packageJson, readmeMd };

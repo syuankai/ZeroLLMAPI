@@ -285,6 +285,25 @@ main();
 
 ---
 
+## 🛠️ 常見問題排除 (Troubleshooting)
+
+### Q: 在 Cloudflare Pages / Workers Builds 出現 `Unknown lockfile version: failed to parse lockfile: 'bun.lock'`？
+* **問題原因**：Cloudflare / CI 建置環境偵測到倉庫中含有 `bun.lock` 時，會自動嘗試執行 `bun install --frozen-lockfile`。若環境內建的 Bun 版本（如 `bun@1.2.15`）與本地產生的 lockfile 版本不符時，便會報錯中斷。
+* **快速解決方案**：
+  1. **刪除 `bun.lock` 檔案**：
+     ```bash
+     git rm bun.lock
+     git commit -m "fix: remove bun.lock to use standard npm"
+     git push origin main
+     ```
+  2. **在 Cloudflare Dashboard 建置設定中指定 npm**：
+     * 前往 **Settings** -> **Builds & deployments**。
+     * 確認 **Build command** 設為 `npm install && npm run build`（或部署 Worker 時使用 `npx wrangler deploy`）。
+  3. **或直接使用本專案提供的 GitHub Actions (`.github/workflows/deploy.yml`)**：
+     * Actions 內已配置標準 `actions/setup-node@v4` 與 `npm ci`，穩定且完全不受 Bun lockfile 版本干擾。
+
+---
+
 ## ⚠️ Cloudflare Workers AI 配額提示
 
 使用 **Cloudflare Workers AI** 邊緣原生模型（如 `@cf/meta/llama-3.3-70b-instruct`）時，係調用 Cloudflare 帳戶每日提供之免費神經元配額 (10,000 Neurons/Day)。請留意高負載或連續測試可能消耗配額，進而影響同帳號下其他依賴 Workers AI 的專案服務。
