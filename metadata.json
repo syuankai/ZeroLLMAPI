@@ -1,0 +1,6 @@
+{
+  "name": "EdgeAI Nexus Gateway",
+  "description": "Cloudflare Worker-compatible AI Load Balancing Gateway with AES-256-GCM encrypted provider keys, MySQL/PostgreSQL REST persistence, real-time traffic monitoring, and interactive test playground.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
