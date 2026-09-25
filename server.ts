@@ -18,7 +18,7 @@ import {
 import { testProviderConnection, forwardChatCompletion, ChatCompletionRequest } from './server/providers.js';
 import { loadBalancer } from './server/loadBalancer.js';
 import { generateCloudflareWorkerCode } from './server/workerGenerator.js';
-import { AIProvider, RequestLog } from './server/types.js';
+import { AIProvider, RequestLog, DatabaseConfig } from './server/types.js';
 
 dotenv.config();
 
@@ -30,11 +30,11 @@ const PORT = parseInt(process.env.PORT || '3000', 10);
 
 app.use(express.json({ limit: '10mb' }));
 
-// CORS headers for gateway API and development
+// CORS headers for gateway API and client applications
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
   res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
-  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, x-api-key');
+  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, x-api-key, apikey');
   if (req.method === 'OPTIONS') {
     return res.sendStatus(200);
   }
@@ -63,14 +63,16 @@ app.get('/api/auth/status', (req, res) => {
   const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : '';
   const isAuthenticated = authTokens.has(token);
   const settings = db.getSettings();
+  const dbConfig = db.getDbConfig();
 
   res.json({
     authenticated: isAuthenticated,
     masterKeySet: isMasterKeyCustomized(),
     masterKeyMasked: maskApiKey(getRuntimeMasterKey()),
     adminUsername: db.getAdmin().username,
-    dbConnected: db.getDbConfig().connected,
-    dbType: db.getDbConfig().type,
+    dbConnected: db.isDbReady(),
+    dbType: dbConfig.type,
+    dbError: db.getConnectionError(),
     gatewayStats: {
       activeProviders: db.getProviders().filter((p) => p.enabled && p.encryptedApiKey).length,
       totalProviders: db.getProviders().length,
@@ -99,7 +101,7 @@ app.post('/api/auth/logout', (req, res) => {
   res.json({ success: true });
 });
 
-app.post('/api/auth/change-password', requireAdminAuth, (req, res) => {
+app.post('/api/auth/change-password', requireAdminAuth, async (req, res) => {
   const { oldPassword, newPassword } = req.body;
   const admin = db.getAdmin();
 
@@ -112,7 +114,7 @@ app.post('/api/auth/change-password', requireAdminAuth, (req, res) => {
   }
 
   const { hash, salt } = hashPassword(newPassword);
-  db.setAdmin({
+  await db.setAdmin({
     ...admin,
     passwordHash: hash,
     salt
@@ -122,7 +124,7 @@ app.post('/api/auth/change-password', requireAdminAuth, (req, res) => {
 });
 
 // Master Encryption Key Vault Update
-app.post('/api/vault/set-master-key', requireAdminAuth, (req, res) => {
+app.post('/api/vault/set-master-key', requireAdminAuth, async (req, res) => {
   const { newMasterKey } = req.body;
   if (!newMasterKey || newMasterKey.length < 8) {
     return res.status(400).json({ error: 'Master encryption key must be at least 8 characters long.' });
@@ -130,13 +132,14 @@ app.post('/api/vault/set-master-key', requireAdminAuth, (req, res) => {
 
   const oldMasterKey = getRuntimeMasterKey();
   
-  // Re-encrypt all existing stored provider keys with the new master key!
+  // Re-encrypt all existing stored provider keys with the new master key
   const providers = db.getProviders();
   for (const prov of providers) {
     if (prov.encryptedApiKey) {
       try {
         const plain = decryptSecret(prov.encryptedApiKey, oldMasterKey);
         prov.encryptedApiKey = encryptSecret(plain, newMasterKey);
+        await db.saveProvider(prov);
       } catch (err) {
         console.warn(`Failed to re-encrypt provider ${prov.name}:`, err);
       }
@@ -144,8 +147,7 @@ app.post('/api/vault/set-master-key', requireAdminAuth, (req, res) => {
   }
 
   setRuntimeMasterKey(newMasterKey);
-  db.updateSettings({ masterKeySet: true });
-  db.save();
+  await db.updateSettings({ masterKeySet: true });
 
   res.json({
     success: true,
@@ -161,13 +163,31 @@ app.get('/api/providers', (req, res) => {
   const providers = db.getProviders().map((p) => ({
     ...p,
     hasApiKey: !!p.encryptedApiKey,
-    encryptedApiKey: undefined // Never send encrypted raw blob to client for security
+    encryptedApiKey: undefined // Never send encrypted raw blob to client
   }));
-  res.json({ providers });
+  res.json({ providers, dbConnected: db.isDbReady() });
 });
 
-app.post('/api/providers', requireAdminAuth, (req, res) => {
-  const { name, type, baseUrl, apiKey, model, supportedModels, enabled, weight, priority, customHeaders } = req.body;
+app.post('/api/providers', requireAdminAuth, async (req, res) => {
+  if (!db.isDbReady()) {
+    return res.status(503).json({ error: '資料庫尚未連線，無法儲存提供商。請先在「資料庫設定」中連線 Supabase / PostgreSQL。' });
+  }
+
+  const { 
+    name, 
+    type, 
+    baseUrl, 
+    apiKey, 
+    model, 
+    supportedModels, 
+    enabled, 
+    weight, 
+    priority, 
+    customHeaders,
+    authHeaderType,
+    customAuthHeaderName,
+    requestBodyFormat
+  } = req.body;
 
   if (!name || !type) {
     return res.status(400).json({ error: 'Name and provider type are required' });
@@ -186,22 +206,43 @@ app.post('/api/providers', requireAdminAuth, (req, res) => {
     weight: Number(weight) || 50,
     priority: Number(priority) || 1,
     customHeaders: customHeaders || {},
+    authHeaderType: authHeaderType || 'Bearer',
+    customAuthHeaderName: customAuthHeaderName || undefined,
+    requestBodyFormat: requestBodyFormat || 'openai-chat',
     createdAt: Date.now(),
     updatedAt: Date.now()
   };
 
-  db.saveProvider(newProvider);
+  await db.saveProvider(newProvider);
   res.json({ success: true, provider: { ...newProvider, encryptedApiKey: undefined } });
 });
 
-app.put('/api/providers/:id', requireAdminAuth, (req, res) => {
+app.put('/api/providers/:id', requireAdminAuth, async (req, res) => {
+  if (!db.isDbReady()) {
+    return res.status(503).json({ error: '資料庫尚未連線，無法更新提供商。請先在「資料庫設定」中連線 Supabase / PostgreSQL。' });
+  }
+
   const { id } = req.params;
   const existing = db.getProvider(id);
   if (!existing) {
     return res.status(404).json({ error: 'Provider not found' });
   }
 
-  const { name, type, baseUrl, apiKey, model, supportedModels, enabled, weight, priority, customHeaders } = req.body;
+  const { 
+    name, 
+    type, 
+    baseUrl, 
+    apiKey, 
+    model, 
+    supportedModels, 
+    enabled, 
+    weight, 
+    priority, 
+    customHeaders,
+    authHeaderType,
+    customAuthHeaderName,
+    requestBodyFormat
+  } = req.body;
 
   const updated: AIProvider = {
     ...existing,
@@ -214,6 +255,9 @@ app.put('/api/providers/:id', requireAdminAuth, (req, res) => {
     weight: weight !== undefined ? Number(weight) : existing.weight,
     priority: priority !== undefined ? Number(priority) : existing.priority,
     customHeaders: customHeaders ?? existing.customHeaders,
+    authHeaderType: authHeaderType ?? existing.authHeaderType,
+    customAuthHeaderName: customAuthHeaderName ?? existing.customAuthHeaderName,
+    requestBodyFormat: requestBodyFormat ?? existing.requestBodyFormat,
     updatedAt: Date.now()
   };
 
@@ -223,13 +267,13 @@ app.put('/api/providers/:id', requireAdminAuth, (req, res) => {
     updated.apiKeyMasked = maskApiKey(apiKey.trim());
   }
 
-  db.saveProvider(updated);
+  await db.saveProvider(updated);
   res.json({ success: true, provider: { ...updated, encryptedApiKey: undefined } });
 });
 
-app.delete('/api/providers/:id', requireAdminAuth, (req, res) => {
+app.delete('/api/providers/:id', requireAdminAuth, async (req, res) => {
   const { id } = req.params;
-  db.deleteProvider(id);
+  await db.deleteProvider(id);
   res.json({ success: true, message: 'Provider deleted' });
 });
 
@@ -261,7 +305,7 @@ app.get('/api/routing', (req, res) => {
   });
 });
 
-app.post('/api/routing/settings', requireAdminAuth, (req, res) => {
+app.post('/api/routing/settings', requireAdminAuth, async (req, res) => {
   const {
     loadBalancingStrategy,
     circuitBreakerThreshold,
@@ -272,7 +316,7 @@ app.post('/api/routing/settings', requireAdminAuth, (req, res) => {
     defaultModel
   } = req.body;
 
-  db.updateSettings({
+  await db.updateSettings({
     ...(loadBalancingStrategy && { loadBalancingStrategy }),
     ...(circuitBreakerThreshold && { circuitBreakerThreshold: Number(circuitBreakerThreshold) }),
     ...(circuitBreakerCooldownSec && { circuitBreakerCooldownSec: Number(circuitBreakerCooldownSec) }),
@@ -293,7 +337,11 @@ app.get('/api/keys', (req, res) => {
   res.json({ keys: db.getVirtualKeys() });
 });
 
-app.post('/api/keys', requireAdminAuth, (req, res) => {
+app.post('/api/keys', requireAdminAuth, async (req, res) => {
+  if (!db.isDbReady()) {
+    return res.status(503).json({ error: '資料庫尚未連線，無法儲存金鑰。' });
+  }
+
   const { name, rateLimitRpm, allowedModels } = req.body;
   const { rawKey, keyPrefix, keyHash } = generateGatewayApiKey();
 
@@ -310,64 +358,73 @@ app.post('/api/keys', requireAdminAuth, (req, res) => {
     createdAt: Date.now()
   };
 
-  db.addVirtualKey(newKey);
-  // Only time the rawKey is ever returned to client
+  await db.addVirtualKey(newKey);
   res.json({ success: true, key: newKey, rawSecretKey: rawKey });
 });
 
-app.delete('/api/keys/:id', requireAdminAuth, (req, res) => {
+app.delete('/api/keys/:id', requireAdminAuth, async (req, res) => {
   const { id } = req.params;
-  db.deleteVirtualKey(id);
+  await db.deleteVirtualKey(id);
   res.json({ success: true });
 });
 
 // -------------------------------------------------------------
-// 5. Database Config & Connection Testing
+// 5. Database Direct & REST Connection Endpoints
 // -------------------------------------------------------------
 
 app.get('/api/database/config', (req, res) => {
   const config = db.getDbConfig();
   res.json({
-    ...config,
-    restApiKeyMasked: config.restApiKey ? maskApiKey(config.restApiKey) : undefined,
-    restApiKey: undefined
+    type: config.type,
+    host: config.host,
+    port: config.port,
+    database: config.database,
+    user: config.user,
+    ssl: config.ssl,
+    connected: db.isDbReady(),
+    error: db.getConnectionError(),
+    lastSyncedAt: config.lastSyncedAt
   });
 });
 
-app.post('/api/database/config', requireAdminAuth, async (req, res) => {
-  const { type, restEndpoint, restApiKey } = req.body;
-  
-  db.updateDbConfig({
-    type: type || 'sqlite-local',
-    restEndpoint: restEndpoint || '',
-    ...(restApiKey && !restApiKey.includes('••••') && { restApiKey }),
-  });
+app.post('/api/database/connect', requireAdminAuth, async (req, res) => {
+  const { host, port, database, user, password, connectionString, ssl } = req.body;
 
-  if (type !== 'sqlite-local' && restEndpoint) {
-    const test = await db.testRestDbConnection(restEndpoint, restApiKey, type);
-    db.updateDbConfig({ connected: test.success, lastSyncedAt: test.success ? Date.now() : undefined });
-    return res.json({ success: test.success, message: test.message, config: db.getDbConfig() });
-  } else {
-    db.updateDbConfig({ connected: true, lastSyncedAt: Date.now() });
-    return res.json({ success: true, message: 'Local storage configured.', config: db.getDbConfig() });
-  }
+  const targetConfig: DatabaseConfig = {
+    type: 'supabase-direct',
+    host: host ? String(host).trim() : undefined,
+    port: Number(port) || 5432,
+    database: database ? String(database).trim() : 'postgres',
+    user: user ? String(user).trim() : 'postgres',
+    password: password ? String(password) : undefined,
+    connectionString: connectionString ? String(connectionString).trim() : undefined,
+    ssl: ssl !== false,
+    connected: false
+  };
+
+  const result = await db.connectPostgresDirect(targetConfig);
+  res.json({
+    ...result,
+    config: db.getDbConfig()
+  });
 });
 
 app.post('/api/database/test', requireAdminAuth, async (req, res) => {
-  const { restEndpoint, restApiKey, type } = req.body;
-  const targetEndpoint = restEndpoint || db.getDbConfig().restEndpoint;
-  const targetKey = restApiKey || db.getDbConfig().restApiKey;
+  const { host, port, database, user, password, connectionString, ssl } = req.body;
 
-  if (!targetEndpoint) {
-    return res.status(400).json({ success: false, message: 'Please specify a REST endpoint URL.' });
-  }
+  const targetConfig: DatabaseConfig = {
+    type: 'supabase-direct',
+    host: host ? String(host).trim() : undefined,
+    port: Number(port) || 5432,
+    database: database ? String(database).trim() : 'postgres',
+    user: user ? String(user).trim() : 'postgres',
+    password: password ? String(password) : undefined,
+    connectionString: connectionString ? String(connectionString).trim() : undefined,
+    ssl: ssl !== false,
+    connected: false
+  };
 
-  const result = await db.testRestDbConnection(targetEndpoint, targetKey, type);
-  res.json(result);
-});
-
-app.post('/api/database/sync', requireAdminAuth, async (req, res) => {
-  const result = await db.syncToExternalRestDb();
+  const result = await db.connectPostgresDirect(targetConfig);
   res.json(result);
 });
 
@@ -420,12 +477,13 @@ app.get('/api/stats', (req, res) => {
       avgLatency: data.avgLatency
     })),
     healthMap,
-    recentLogs: db.getLogs(30)
+    recentLogs: db.getLogs(30),
+    dbConnected: db.isDbReady()
   });
 });
 
-app.delete('/api/stats/logs', requireAdminAuth, (req, res) => {
-  db.clearLogs();
+app.delete('/api/stats/logs', requireAdminAuth, async (req, res) => {
+  await db.clearLogs();
   res.json({ success: true });
 });
 
@@ -445,6 +503,10 @@ app.get('/api/export/cloudflare-worker', (req, res) => {
 // -------------------------------------------------------------
 
 app.get('/v1/models', (req, res) => {
+  if (!db.isDbReady()) {
+    return res.status(503).json({ error: { message: 'Database connection required. Please connect Supabase/PostgreSQL.' } });
+  }
+
   const providers = db.getProviders().filter((p) => p.enabled);
   const models = providers.flatMap((p) =>
     p.supportedModels.map((m) => ({
@@ -459,12 +521,23 @@ app.get('/v1/models', (req, res) => {
 });
 
 app.post('/v1/chat/completions', async (req, res) => {
+  // Strict check: database connection is required
+  if (!db.isDbReady()) {
+    return res.status(503).json({
+      error: {
+        message: '資料庫尚未連線或無法連線至 Supabase/PostgreSQL。請先在控制台「資料庫設定」頁面完成連線設定。(Database required to operate gateway)',
+        type: 'gateway_database_not_connected',
+        code: 503
+      }
+    });
+  }
+
   const startTime = Date.now();
   const settings = db.getSettings();
   const body: ChatCompletionRequest = req.body;
   const clientIp = (req.headers['x-forwarded-for'] as string) || req.socket.remoteAddress || '127.0.0.1';
 
-  // Check auth if enabled
+  // Check virtual key auth if enabled
   let matchedKeyPrefix = '';
   if (settings.requireAuthForV1) {
     const authHeader = req.headers.authorization || '';
@@ -489,13 +562,11 @@ app.post('/v1/chat/completions', async (req, res) => {
 
     const { response: upstreamResponse, resolvedProvider, durationMs, fallbackTrace, fallbackCount } = execution;
 
-    // Add custom Gateway response headers
     res.setHeader('x-gateway-provider', resolvedProvider.name);
     res.setHeader('x-gateway-latency-ms', durationMs.toString());
     res.setHeader('x-gateway-fallback-count', fallbackCount.toString());
 
     if (isStreaming) {
-      // Setup Server-Sent Events (SSE) stream
       res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
       res.setHeader('Cache-Control', 'no-cache');
       res.setHeader('Connection', 'keep-alive');
@@ -525,10 +596,8 @@ app.post('/v1/chat/completions', async (req, res) => {
           }
           res.end();
 
-          // Approx tokens calculation from stream bytes
           const approxTokens = Math.max(1, Math.round(streamBytes / 4));
 
-          // Log request
           const logEntry: RequestLog = {
             id: `req-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
             timestamp: Date.now(),
@@ -549,10 +618,10 @@ app.post('/v1/chat/completions', async (req, res) => {
             totalTokens: approxTokens,
             streaming: true
           };
-          db.addLog(logEntry);
+          await db.addLog(logEntry);
 
           if (matchedKeyPrefix) {
-            db.incrementKeyUsage(matchedKeyPrefix, approxTokens);
+            await db.incrementKeyUsage(matchedKeyPrefix, approxTokens);
           }
         } catch (streamErr: any) {
           console.error('Error during streaming chunk dispatch:', streamErr);
@@ -562,7 +631,6 @@ app.post('/v1/chat/completions', async (req, res) => {
 
       await pump();
     } else {
-      // Non-streaming response
       const data = await upstreamResponse.json();
       const promptTokens = data.usage?.prompt_tokens || 0;
       const completionTokens = data.usage?.completion_tokens || 0;
@@ -587,10 +655,10 @@ app.post('/v1/chat/completions', async (req, res) => {
         totalTokens,
         streaming: false
       };
-      db.addLog(logEntry);
+      await db.addLog(logEntry);
 
       if (matchedKeyPrefix) {
-        db.incrementKeyUsage(matchedKeyPrefix, totalTokens);
+        await db.incrementKeyUsage(matchedKeyPrefix, totalTokens);
       }
 
       res.status(200).json(data);
@@ -619,7 +687,7 @@ app.post('/v1/chat/completions', async (req, res) => {
       streaming: isStreaming,
       errorMessage: err.message
     };
-    db.addLog(logEntry);
+    await db.addLog(logEntry);
 
     res.status(502).json({
       error: {

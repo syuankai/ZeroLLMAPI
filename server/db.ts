@@ -1,11 +1,6 @@
-import fs from 'node:fs';
-import path from 'node:path';
-import { AIProvider, DatabaseConfig, GatewaySettings, ProviderHealth, RequestLog, VirtualApiKey, AdminUser } from './types.js';
+import { Pool } from 'pg';
+import { AIProvider, DatabaseConfig, GatewaySettings, RequestLog, VirtualApiKey, AdminUser } from './types.js';
 import { encryptSecret, maskApiKey, hashPassword } from './crypto.js';
-
-// Local storage path for fallback persistence
-const DATA_DIR = path.resolve(process.cwd(), '.data');
-const DB_FILE = path.join(DATA_DIR, 'nexus_gateway_store.json');
 
 interface DatabaseStore {
   admin: AdminUser;
@@ -16,391 +11,552 @@ interface DatabaseStore {
   requestLogs: RequestLog[];
 }
 
-// Initial default seed state
 const initialAdminHash = hashPassword('admin123456');
-const DEFAULT_STORE: DatabaseStore = {
-  admin: {
-    username: 'admin',
-    passwordHash: initialAdminHash.hash,
-    salt: initialAdminHash.salt,
-    createdAt: Date.now()
-  },
-  settings: {
-    masterKeySet: false,
-    loadBalancingStrategy: 'fallback-cascade',
-    circuitBreakerThreshold: 3,
-    circuitBreakerCooldownSec: 30,
-    maxRetriesPerRequest: 2,
-    requestTimeoutMs: 25000,
-    requireAuthForV1: false,
-    defaultModel: 'gemini-2.5-flash'
-  },
-  dbConfig: {
-    type: 'sqlite-local',
-    connected: true,
-    lastSyncedAt: Date.now()
-  },
-  providers: [
-    {
-      id: 'prov-gemini',
-      name: 'Google Gemini (Official Free Tier)',
-      type: 'gemini',
-      baseUrl: 'https://generativelanguage.googleapis.com',
-      encryptedApiKey: process.env.GEMINI_API_KEY ? encryptSecret(process.env.GEMINI_API_KEY) : '',
-      apiKeyMasked: process.env.GEMINI_API_KEY ? maskApiKey(process.env.GEMINI_API_KEY) : '',
-      model: 'gemini-2.5-flash',
-      supportedModels: ['gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-1.5-pro', 'gemini-1.5-flash'],
-      enabled: !!process.env.GEMINI_API_KEY,
-      weight: 40,
-      priority: 1,
-      rateLimitRpm: 60,
-      createdAt: Date.now(),
-      updatedAt: Date.now()
-    },
-    {
-      id: 'prov-groq',
-      name: 'Groq (Ultra-Fast Free Tier)',
-      type: 'groq',
-      baseUrl: 'https://api.groq.com/openai/v1',
-      encryptedApiKey: '',
-      apiKeyMasked: '',
-      model: 'llama-3.3-70b-versatile',
-      supportedModels: ['llama-3.3-70b-versatile', 'llama-3.1-8b-instant', 'mixtral-8x7b-32768', 'gemma2-9b-it'],
-      enabled: false,
-      weight: 35,
-      priority: 2,
-      rateLimitRpm: 30,
-      createdAt: Date.now(),
-      updatedAt: Date.now()
-    },
-    {
-      id: 'prov-openrouter',
-      name: 'OpenRouter (Free Router Tier)',
-      type: 'openrouter',
-      baseUrl: 'https://openrouter.ai/api/v1',
-      encryptedApiKey: '',
-      apiKeyMasked: '',
-      model: 'meta-llama/llama-3.3-70b-instruct:free',
-      supportedModels: [
-        'meta-llama/llama-3.3-70b-instruct:free',
-        'deepseek/deepseek-r1:free',
-        'google/gemini-2.0-flash-lite-preview:free',
-        'mistralai/mistral-7b-instruct:free'
-      ],
-      enabled: false,
-      weight: 25,
-      priority: 3,
-      rateLimitRpm: 20,
-      createdAt: Date.now(),
-      updatedAt: Date.now()
-    },
-    {
-      id: 'prov-mistral',
-      name: 'Mistral AI (La Plateforme Free Tier)',
-      type: 'mistral',
-      baseUrl: 'https://api.mistral.ai/v1',
-      encryptedApiKey: '',
-      apiKeyMasked: '',
-      model: 'mistral-small-latest',
-      supportedModels: ['mistral-small-latest', 'codestral-latest', 'mistral-large-latest', 'open-mistral-nemo'],
-      enabled: false,
-      weight: 20,
-      priority: 4,
-      rateLimitRpm: 30,
-      createdAt: Date.now(),
-      updatedAt: Date.now()
-    },
-    {
-      id: 'prov-cerebras',
-      name: 'Cerebras (Ultra-Fast Hardware Inference)',
-      type: 'cerebras',
-      baseUrl: 'https://api.cerebras.ai/v1',
-      encryptedApiKey: '',
-      apiKeyMasked: '',
-      model: 'llama3.3-70b',
-      supportedModels: ['llama3.3-70b', 'llama3.1-8b'],
-      enabled: false,
-      weight: 30,
-      priority: 2,
-      rateLimitRpm: 30,
-      createdAt: Date.now(),
-      updatedAt: Date.now()
-    }
-  ],
-  virtualKeys: [
-    {
-      id: 'key-default-demo',
-      name: 'Default Client Key',
-      keyHash: 'sha256-demo-placeholder',
-      keyPrefix: 'gw-live-demo...',
-      allowedModels: ['*'],
-      rateLimitRpm: 120,
-      totalUsageTokens: 0,
-      totalRequests: 0,
-      enabled: true,
-      createdAt: Date.now()
-    }
-  ],
-  requestLogs: []
-};
 
 class DatabaseManager {
-  private store: DatabaseStore;
+  private pool: Pool | null = null;
+  private memoryCache: DatabaseStore;
+  private isConnected: boolean = false;
+  private connectionError: string | null = null;
 
   constructor() {
-    this.store = this.loadLocalStore();
+    this.memoryCache = {
+      admin: {
+        username: 'admin',
+        passwordHash: initialAdminHash.hash,
+        salt: initialAdminHash.salt,
+        createdAt: Date.now()
+      },
+      settings: {
+        masterKeySet: false,
+        loadBalancingStrategy: 'fallback-cascade',
+        circuitBreakerThreshold: 3,
+        circuitBreakerCooldownSec: 30,
+        maxRetriesPerRequest: 2,
+        requestTimeoutMs: 25000,
+        requireAuthForV1: false,
+        defaultModel: 'gemini-2.5-flash'
+      },
+      dbConfig: {
+        type: 'supabase-direct',
+        host: process.env.SUPABASE_HOST || process.env.PGHOST || '',
+        port: parseInt(process.env.SUPABASE_PORT || process.env.PGPORT || '5432', 10),
+        database: process.env.SUPABASE_DATABASE || process.env.PGDATABASE || 'postgres',
+        user: process.env.SUPABASE_USER || process.env.PGUSER || 'postgres',
+        password: process.env.SUPABASE_PASSWORD || process.env.PGPASSWORD || '',
+        connectionString: process.env.DATABASE_URL || process.env.SUPABASE_DB_URL || '',
+        ssl: true,
+        connected: false
+      },
+      providers: [],
+      virtualKeys: [],
+      requestLogs: []
+    };
+
+    // Attempt auto-connection if ENV vars are provided
+    this.autoConnectFromEnv();
   }
 
-  private loadLocalStore(): DatabaseStore {
-    try {
-      if (!fs.existsSync(DATA_DIR)) {
-        fs.mkdirSync(DATA_DIR, { recursive: true });
-      }
-      if (fs.existsSync(DB_FILE)) {
-        const raw = fs.readFileSync(DB_FILE, 'utf-8');
-        const parsed = JSON.parse(raw);
-        // If GEMINI_API_KEY is available from ENV and gemini provider has no key, inject it
-        if (process.env.GEMINI_API_KEY) {
-          const gemini = parsed.providers?.find((p: AIProvider) => p.type === 'gemini');
-          if (gemini && !gemini.encryptedApiKey) {
-            gemini.encryptedApiKey = encryptSecret(process.env.GEMINI_API_KEY);
-            gemini.apiKeyMasked = maskApiKey(process.env.GEMINI_API_KEY);
-            gemini.enabled = true;
-          }
-        }
-        return {
-          ...DEFAULT_STORE,
-          ...parsed,
-          settings: { ...DEFAULT_STORE.settings, ...(parsed.settings || {}) },
-          dbConfig: { ...DEFAULT_STORE.dbConfig, ...(parsed.dbConfig || {}) }
-        };
-      }
-    } catch (err) {
-      console.warn('Could not load local database store, initializing default:', err);
-    }
-    this.saveLocalStore(DEFAULT_STORE);
-    return DEFAULT_STORE;
-  }
-
-  private saveLocalStore(data: DatabaseStore) {
-    try {
-      if (!fs.existsSync(DATA_DIR)) {
-        fs.mkdirSync(DATA_DIR, { recursive: true });
-      }
-      fs.writeFileSync(DB_FILE, JSON.stringify(data, null, 2), 'utf-8');
-    } catch (err) {
-      console.error('Failed to save local store:', err);
-    }
-  }
-
-  public getStore(): DatabaseStore {
-    return this.store;
-  }
-
-  public save() {
-    this.saveLocalStore(this.store);
-    // If external REST DB is configured and connected, trigger async sync in background
-    if (this.store.dbConfig.type !== 'sqlite-local' && this.store.dbConfig.restEndpoint) {
-      this.syncToExternalRestDb().catch((e) => console.warn('Background REST DB sync warning:', e.message));
+  private async autoConnectFromEnv() {
+    const { host, port, database, user, password, connectionString } = this.memoryCache.dbConfig;
+    if (connectionString || (host && user && password)) {
+      console.log('[DB] Auto-connecting to PostgreSQL/Supabase database from environment variables...');
+      await this.connectPostgresDirect({
+        type: 'supabase-direct',
+        host,
+        port,
+        database,
+        user,
+        password,
+        connectionString,
+        ssl: true,
+        connected: false
+      });
     }
   }
 
-  // Admin User operations
-  public getAdmin(): AdminUser {
-    return this.store.admin;
+  public isDbReady(): boolean {
+    return this.isConnected;
   }
 
-  public setAdmin(admin: AdminUser) {
-    this.store.admin = admin;
-    this.save();
+  public getConnectionError(): string | null {
+    return this.connectionError;
   }
 
-  // Providers operations
-  public getProviders(): AIProvider[] {
-    return this.store.providers;
-  }
-
-  public getProvider(id: string): AIProvider | undefined {
-    return this.store.providers.find((p) => p.id === id);
-  }
-
-  public saveProvider(provider: AIProvider) {
-    const idx = this.store.providers.findIndex((p) => p.id === provider.id);
-    if (idx >= 0) {
-      this.store.providers[idx] = { ...provider, updatedAt: Date.now() };
-    } else {
-      this.store.providers.push({ ...provider, createdAt: Date.now(), updatedAt: Date.now() });
-    }
-    this.save();
-  }
-
-  public deleteProvider(id: string) {
-    this.store.providers = this.store.providers.filter((p) => p.id !== id);
-    this.save();
-  }
-
-  // Virtual Keys
-  public getVirtualKeys(): VirtualApiKey[] {
-    return this.store.virtualKeys;
-  }
-
-  public addVirtualKey(key: VirtualApiKey) {
-    this.store.virtualKeys.push(key);
-    this.save();
-  }
-
-  public deleteVirtualKey(id: string) {
-    this.store.virtualKeys = this.store.virtualKeys.filter((k) => k.id !== id);
-    this.save();
-  }
-
-  public incrementKeyUsage(keyPrefix: string, tokens: number) {
-    const key = this.store.virtualKeys.find((k) => k.keyPrefix === keyPrefix);
-    if (key) {
-      key.totalRequests += 1;
-      key.totalUsageTokens += tokens;
-      key.lastUsedAt = Date.now();
-      this.save();
-    }
-  }
-
-  // Settings
-  public getSettings(): GatewaySettings {
-    return this.store.settings;
-  }
-
-  public updateSettings(settings: Partial<GatewaySettings>) {
-    this.store.settings = { ...this.store.settings, ...settings };
-    this.save();
-  }
-
-  // Database Config
-  public getDbConfig(): DatabaseConfig {
-    return this.store.dbConfig;
-  }
-
-  public updateDbConfig(config: Partial<DatabaseConfig>) {
-    this.store.dbConfig = { ...this.store.dbConfig, ...config };
-    this.save();
-  }
-
-  // Request Logs (Keeps last 200 logs in memory/disk)
-  public addLog(log: RequestLog) {
-    this.store.requestLogs.unshift(log);
-    if (this.store.requestLogs.length > 200) {
-      this.store.requestLogs = this.store.requestLogs.slice(0, 200);
-    }
-    this.save();
-  }
-
-  public getLogs(limit = 50): RequestLog[] {
-    return this.store.requestLogs.slice(0, limit);
-  }
-
-  public clearLogs() {
-    this.store.requestLogs = [];
-    this.save();
-  }
-
-  // External REST DB Sync & Connection Test (PostgreSQL / PostgREST / MySQL REST)
-  public async testRestDbConnection(endpoint: string, apiKey?: string, dbType: string = 'postgres-rest'): Promise<{ success: boolean; message: string; latencyMs: number }> {
+  /**
+   * Connects directly to Supabase / PostgreSQL using pg.Pool
+   */
+  public async connectPostgresDirect(config: DatabaseConfig): Promise<{ success: boolean; message: string; latencyMs: number }> {
     const start = Date.now();
     try {
-      const headers: Record<string, string> = {
-        'Content-Type': 'application/json',
-      };
-      if (apiKey) {
-        headers['Authorization'] = `Bearer ${apiKey}`;
-        headers['apikey'] = apiKey; // Standard PostgREST header
+      if (this.pool) {
+        await this.pool.end().catch(() => {});
+        this.pool = null;
       }
 
-      // Check URL connectivity
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 8000);
+      let poolConfig: any;
 
-      const resp = await fetch(endpoint, {
-        method: 'GET',
-        headers,
-        signal: controller.signal
-      });
-      clearTimeout(timeoutId);
-      const latencyMs = Date.now() - start;
-
-      if (resp.status < 500) {
-        return {
-          success: true,
-          message: `REST API Endpoint connected successfully (${resp.status} ${resp.statusText})`,
-          latencyMs
+      if (config.connectionString && config.connectionString.trim().startsWith('postgres')) {
+        poolConfig = {
+          connectionString: config.connectionString.trim(),
+          ssl: config.ssl !== false ? { rejectUnauthorized: false } : false,
+          connectionTimeoutMillis: 10000,
         };
       } else {
-        return {
-          success: false,
-          message: `Endpoint returned error HTTP ${resp.status}: ${resp.statusText}`,
-          latencyMs
+        if (!config.host || !config.user || !config.password) {
+          throw new Error('Host, User, and Password are required for Supabase/PostgreSQL connection.');
+        }
+
+        poolConfig = {
+          host: config.host.trim(),
+          port: Number(config.port) || 5432,
+          database: (config.database || 'postgres').trim(),
+          user: config.user.trim(),
+          password: config.password.trim(),
+          ssl: config.ssl !== false ? { rejectUnauthorized: false } : false,
+          connectionTimeoutMillis: 10000,
         };
       }
+
+      const testPool = new Pool(poolConfig);
+      const client = await testPool.connect();
+      const latencyMs = Date.now() - start;
+
+      // Initialize database schema tables if not exist
+      await this.initSchema(client);
+      client.release();
+
+      this.pool = testPool;
+      this.isConnected = true;
+      this.connectionError = null;
+
+      this.memoryCache.dbConfig = {
+        ...config,
+        connected: true,
+        lastSyncedAt: Date.now(),
+        error: undefined
+      };
+
+      // Load all records from DB into cache
+      await this.loadFromDatabase();
+
+      return {
+        success: true,
+        message: `Successfully connected to Supabase/PostgreSQL! Schema tables verified.`,
+        latencyMs
+      };
     } catch (err: any) {
+      this.isConnected = false;
+      this.connectionError = err.message || String(err);
+      this.memoryCache.dbConfig.connected = false;
+      this.memoryCache.dbConfig.error = this.connectionError || undefined;
+
       return {
         success: false,
-        message: `Connection failed: ${err.message || String(err)}`,
+        message: `Connection failed: ${err.message}`,
         latencyMs: Date.now() - start
       };
     }
   }
 
-  public async syncToExternalRestDb(): Promise<{ success: boolean; message: string }> {
-    const { restEndpoint, restApiKey, type } = this.store.dbConfig;
-    if (!restEndpoint) {
-      return { success: false, message: 'No REST API endpoint configured' };
-    }
+  /**
+   * Initializes PostgreSQL / Supabase database tables
+   */
+  private async initSchema(client: any) {
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS nexus_gateway_settings (
+        id VARCHAR(32) PRIMARY KEY,
+        settings JSONB NOT NULL,
+        admin JSONB NOT NULL,
+        updated_at BIGINT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS nexus_providers (
+        id VARCHAR(64) PRIMARY KEY,
+        name VARCHAR(255) NOT NULL,
+        type VARCHAR(64) NOT NULL,
+        base_url TEXT NOT NULL,
+        encrypted_api_key TEXT NOT NULL,
+        api_key_masked VARCHAR(64),
+        model VARCHAR(128) NOT NULL,
+        supported_models JSONB NOT NULL,
+        enabled BOOLEAN NOT NULL DEFAULT true,
+        weight INTEGER NOT NULL DEFAULT 50,
+        priority INTEGER NOT NULL DEFAULT 1,
+        max_tokens INTEGER,
+        rate_limit_rpm INTEGER,
+        custom_headers JSONB,
+        auth_header_type VARCHAR(32),
+        custom_auth_header_name VARCHAR(128),
+        request_body_format VARCHAR(32),
+        created_at BIGINT NOT NULL,
+        updated_at BIGINT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS nexus_virtual_keys (
+        id VARCHAR(64) PRIMARY KEY,
+        name VARCHAR(255) NOT NULL,
+        key_hash VARCHAR(128) NOT NULL,
+        key_prefix VARCHAR(64) NOT NULL,
+        allowed_models JSONB NOT NULL,
+        rate_limit_rpm INTEGER NOT NULL DEFAULT 60,
+        total_usage_tokens BIGINT NOT NULL DEFAULT 0,
+        total_requests BIGINT NOT NULL DEFAULT 0,
+        enabled BOOLEAN NOT NULL DEFAULT true,
+        created_at BIGINT NOT NULL,
+        last_used_at BIGINT
+      );
+
+      CREATE TABLE IF NOT EXISTS nexus_request_logs (
+        id VARCHAR(64) PRIMARY KEY,
+        timestamp BIGINT NOT NULL,
+        client_ip VARCHAR(64),
+        virtual_key_prefix VARCHAR(64),
+        requested_model VARCHAR(128) NOT NULL,
+        resolved_provider_id VARCHAR(64) NOT NULL,
+        resolved_provider_name VARCHAR(255) NOT NULL,
+        resolved_model VARCHAR(128) NOT NULL,
+        duration_ms INTEGER NOT NULL,
+        ttft_ms INTEGER,
+        status_code INTEGER NOT NULL,
+        success BOOLEAN NOT NULL,
+        fallback_count INTEGER NOT NULL DEFAULT 0,
+        fallback_trace JSONB,
+        prompt_tokens INTEGER NOT NULL DEFAULT 0,
+        completion_tokens INTEGER NOT NULL DEFAULT 0,
+        total_tokens INTEGER NOT NULL DEFAULT 0,
+        streaming BOOLEAN NOT NULL DEFAULT false,
+        error_message TEXT
+      );
+    `);
+  }
+
+  /**
+   * Loads all active data from Supabase/PostgreSQL into memory
+   */
+  public async loadFromDatabase() {
+    if (!this.pool || !this.isConnected) return;
 
     try {
-      const headers: Record<string, string> = {
-        'Content-Type': 'application/json',
-        'Prefer': 'resolution=merge-duplicates'
-      };
-      if (restApiKey) {
-        headers['Authorization'] = `Bearer ${restApiKey}`;
-        headers['apikey'] = restApiKey;
-      }
-
-      // Payload contains only encrypted API keys and gateway state
-      const payload = {
-        app_id: 'edgeai_nexus_gateway',
-        synced_at: new Date().toISOString(),
-        settings: this.store.settings,
-        providers_encrypted: this.store.providers.map(p => ({
-          id: p.id,
-          name: p.name,
-          type: p.type,
-          baseUrl: p.baseUrl,
-          encryptedApiKey: p.encryptedApiKey, // Guaranteed AES-256-GCM encrypted
-          model: p.model,
-          enabled: p.enabled,
-          weight: p.weight,
-          priority: p.priority,
-          supportedModels: p.supportedModels
-        })),
-        virtual_keys: this.store.virtualKeys
-      };
-
-      const resp = await fetch(restEndpoint, {
-        method: 'POST',
-        headers,
-        body: JSON.stringify(payload)
-      });
-
-      if (resp.ok || resp.status === 201 || resp.status === 200 || resp.status === 204) {
-        this.store.dbConfig.connected = true;
-        this.store.dbConfig.lastSyncedAt = Date.now();
-        this.saveLocalStore(this.store);
-        return { success: true, message: `Synced successfully to external ${type} at ${new Date().toLocaleTimeString()}` };
+      // 1. Load Settings & Admin
+      const settingsRes = await this.pool.query(`SELECT settings, admin FROM nexus_gateway_settings WHERE id = 'main'`);
+      if (settingsRes.rows.length > 0) {
+        this.memoryCache.settings = { ...this.memoryCache.settings, ...settingsRes.rows[0].settings };
+        this.memoryCache.admin = { ...this.memoryCache.admin, ...settingsRes.rows[0].admin };
       } else {
-        const text = await resp.text().catch(() => '');
-        return { success: false, message: `Sync failed with status ${resp.status}: ${text.slice(0, 100)}` };
+        // Insert default initial settings
+        await this.pool.query(
+          `INSERT INTO nexus_gateway_settings (id, settings, admin, updated_at) VALUES ($1, $2, $3, $4)`,
+          ['main', JSON.stringify(this.memoryCache.settings), JSON.stringify(this.memoryCache.admin), Date.now()]
+        );
       }
+
+      // 2. Load Providers
+      const provRes = await this.pool.query(`SELECT * FROM nexus_providers ORDER BY priority ASC, weight DESC`);
+      this.memoryCache.providers = provRes.rows.map((row: any) => ({
+        id: row.id,
+        name: row.name,
+        type: row.type,
+        baseUrl: row.base_url,
+        encryptedApiKey: row.encrypted_api_key,
+        apiKeyMasked: row.api_key_masked,
+        model: row.model,
+        supportedModels: Array.isArray(row.supported_models) ? row.supported_models : JSON.parse(row.supported_models || '[]'),
+        enabled: row.enabled,
+        weight: row.weight,
+        priority: row.priority,
+        maxTokens: row.max_tokens,
+        rateLimitRpm: row.rate_limit_rpm,
+        customHeaders: typeof row.custom_headers === 'object' ? row.custom_headers : JSON.parse(row.custom_headers || '{}'),
+        authHeaderType: row.auth_header_type,
+        customAuthHeaderName: row.custom_auth_header_name,
+        requestBodyFormat: row.request_body_format,
+        createdAt: Number(row.created_at),
+        updatedAt: Number(row.updated_at)
+      }));
+
+      // If GEMINI_API_KEY from env exists and no gemini provider exists, create default Gemini in DB
+      if (process.env.GEMINI_API_KEY && !this.memoryCache.providers.some(p => p.type === 'gemini')) {
+        const defaultGemini: AIProvider = {
+          id: 'prov-gemini-default',
+          name: 'Google Gemini 2.5 Flash',
+          type: 'gemini',
+          baseUrl: 'https://generativelanguage.googleapis.com',
+          encryptedApiKey: encryptSecret(process.env.GEMINI_API_KEY),
+          apiKeyMasked: maskApiKey(process.env.GEMINI_API_KEY),
+          model: 'gemini-2.5-flash',
+          supportedModels: ['gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-1.5-pro', 'gemini-1.5-flash'],
+          enabled: true,
+          weight: 40,
+          priority: 1,
+          createdAt: Date.now(),
+          updatedAt: Date.now()
+        };
+        await this.saveProvider(defaultGemini);
+      }
+
+      // 3. Load Virtual Keys
+      const keysRes = await this.pool.query(`SELECT * FROM nexus_virtual_keys ORDER BY created_at DESC`);
+      this.memoryCache.virtualKeys = keysRes.rows.map((row: any) => ({
+        id: row.id,
+        name: row.name,
+        keyHash: row.key_hash,
+        keyPrefix: row.key_prefix,
+        allowedModels: Array.isArray(row.allowed_models) ? row.allowed_models : JSON.parse(row.allowed_models || '[]'),
+        rateLimitRpm: row.rate_limit_rpm,
+        totalUsageTokens: Number(row.total_usage_tokens),
+        totalRequests: Number(row.total_requests),
+        enabled: row.enabled,
+        createdAt: Number(row.created_at),
+        lastUsedAt: row.last_used_at ? Number(row.last_used_at) : undefined
+      }));
+
+      // 4. Load Recent Logs (last 100)
+      const logsRes = await this.pool.query(`SELECT * FROM nexus_request_logs ORDER BY timestamp DESC LIMIT 100`);
+      this.memoryCache.requestLogs = logsRes.rows.map((row: any) => ({
+        id: row.id,
+        timestamp: Number(row.timestamp),
+        clientIp: row.client_ip,
+        virtualKeyPrefix: row.virtual_key_prefix,
+        requestedModel: row.requested_model,
+        resolvedProviderId: row.resolved_provider_id,
+        resolvedProviderName: row.resolved_provider_name,
+        resolvedModel: row.resolved_model,
+        durationMs: row.duration_ms,
+        ttftMs: row.ttft_ms,
+        statusCode: row.status_code,
+        success: row.success,
+        fallbackCount: row.fallback_count,
+        fallbackTrace: Array.isArray(row.fallback_trace) ? row.fallback_trace : JSON.parse(row.fallback_trace || '[]'),
+        promptTokens: row.prompt_tokens,
+        completionTokens: row.completion_tokens,
+        totalTokens: row.total_tokens,
+        streaming: row.streaming,
+        errorMessage: row.error_message
+      }));
+
+      console.log(`[DB] Loaded ${this.memoryCache.providers.length} providers, ${this.memoryCache.virtualKeys.length} keys from Supabase/PostgreSQL.`);
     } catch (err: any) {
-      return { success: false, message: `Sync error: ${err.message || String(err)}` };
+      console.error('[DB] Error loading from database:', err.message);
+    }
+  }
+
+  // Admin User operations
+  public getAdmin(): AdminUser {
+    return this.memoryCache.admin;
+  }
+
+  public async setAdmin(admin: AdminUser) {
+    this.memoryCache.admin = admin;
+    if (this.pool && this.isConnected) {
+      await this.pool.query(
+        `UPDATE nexus_gateway_settings SET admin = $1, updated_at = $2 WHERE id = 'main'`,
+        [JSON.stringify(admin), Date.now()]
+      ).catch((e: any) => console.error('Error saving admin to DB:', e));
+    }
+  }
+
+  // Providers operations
+  public getProviders(): AIProvider[] {
+    return this.memoryCache.providers;
+  }
+
+  public getProvider(id: string): AIProvider | undefined {
+    return this.memoryCache.providers.find((p) => p.id === id);
+  }
+
+  public async saveProvider(provider: AIProvider) {
+    const idx = this.memoryCache.providers.findIndex((p) => p.id === provider.id);
+    if (idx >= 0) {
+      this.memoryCache.providers[idx] = { ...provider, updatedAt: Date.now() };
+    } else {
+      this.memoryCache.providers.push({ ...provider, createdAt: Date.now(), updatedAt: Date.now() });
+    }
+
+    if (this.pool && this.isConnected) {
+      const p = this.memoryCache.providers.find((item) => item.id === provider.id)!;
+      await this.pool.query(`
+        INSERT INTO nexus_providers (
+          id, name, type, base_url, encrypted_api_key, api_key_masked,
+          model, supported_models, enabled, weight, priority, max_tokens,
+          rate_limit_rpm, custom_headers, auth_header_type, custom_auth_header_name,
+          request_body_format, created_at, updated_at
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
+        ON CONFLICT (id) DO UPDATE SET
+          name = EXCLUDED.name,
+          type = EXCLUDED.type,
+          base_url = EXCLUDED.base_url,
+          encrypted_api_key = EXCLUDED.encrypted_api_key,
+          api_key_masked = EXCLUDED.api_key_masked,
+          model = EXCLUDED.model,
+          supported_models = EXCLUDED.supported_models,
+          enabled = EXCLUDED.enabled,
+          weight = EXCLUDED.weight,
+          priority = EXCLUDED.priority,
+          max_tokens = EXCLUDED.max_tokens,
+          rate_limit_rpm = EXCLUDED.rate_limit_rpm,
+          custom_headers = EXCLUDED.custom_headers,
+          auth_header_type = EXCLUDED.auth_header_type,
+          custom_auth_header_name = EXCLUDED.custom_auth_header_name,
+          request_body_format = EXCLUDED.request_body_format,
+          updated_at = EXCLUDED.updated_at
+      `, [
+        p.id,
+        p.name,
+        p.type,
+        p.baseUrl,
+        p.encryptedApiKey,
+        p.apiKeyMasked || '',
+        p.model,
+        JSON.stringify(p.supportedModels),
+        p.enabled,
+        p.weight,
+        p.priority,
+        p.maxTokens || null,
+        p.rateLimitRpm || null,
+        JSON.stringify(p.customHeaders || {}),
+        p.authHeaderType || null,
+        p.customAuthHeaderName || null,
+        p.requestBodyFormat || null,
+        p.createdAt,
+        p.updatedAt
+      ]).catch((e: any) => console.error('Error persisting provider to DB:', e));
+    }
+  }
+
+  public async deleteProvider(id: string) {
+    this.memoryCache.providers = this.memoryCache.providers.filter((p) => p.id !== id);
+    if (this.pool && this.isConnected) {
+      await this.pool.query(`DELETE FROM nexus_providers WHERE id = $1`, [id]).catch((e: any) => console.error('Error deleting provider from DB:', e));
+    }
+  }
+
+  // Virtual Keys
+  public getVirtualKeys(): VirtualApiKey[] {
+    return this.memoryCache.virtualKeys;
+  }
+
+  public async addVirtualKey(key: VirtualApiKey) {
+    this.memoryCache.virtualKeys.push(key);
+    if (this.pool && this.isConnected) {
+      await this.pool.query(`
+        INSERT INTO nexus_virtual_keys (
+          id, name, key_hash, key_prefix, allowed_models, rate_limit_rpm,
+          total_usage_tokens, total_requests, enabled, created_at, last_used_at
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+      `, [
+        key.id,
+        key.name,
+        key.keyHash,
+        key.keyPrefix,
+        JSON.stringify(key.allowedModels),
+        key.rateLimitRpm,
+        key.totalUsageTokens,
+        key.totalRequests,
+        key.enabled,
+        key.createdAt,
+        key.lastUsedAt || null
+      ]).catch((e: any) => console.error('Error inserting key to DB:', e));
+    }
+  }
+
+  public async deleteVirtualKey(id: string) {
+    this.memoryCache.virtualKeys = this.memoryCache.virtualKeys.filter((k) => k.id !== id);
+    if (this.pool && this.isConnected) {
+      await this.pool.query(`DELETE FROM nexus_virtual_keys WHERE id = $1`, [id]).catch((e: any) => console.error('Error deleting key from DB:', e));
+    }
+  }
+
+  public async incrementKeyUsage(keyPrefix: string, tokens: number) {
+    const key = this.memoryCache.virtualKeys.find((k) => k.keyPrefix === keyPrefix);
+    if (key) {
+      key.totalRequests += 1;
+      key.totalUsageTokens += tokens;
+      key.lastUsedAt = Date.now();
+
+      if (this.pool && this.isConnected) {
+        await this.pool.query(`
+          UPDATE nexus_virtual_keys 
+          SET total_requests = total_requests + 1, total_usage_tokens = total_usage_tokens + $1, last_used_at = $2
+          WHERE key_prefix = $3
+        `, [tokens, key.lastUsedAt, keyPrefix]).catch(() => {});
+      }
+    }
+  }
+
+  // Settings
+  public getSettings(): GatewaySettings {
+    return this.memoryCache.settings;
+  }
+
+  public async updateSettings(settings: Partial<GatewaySettings>) {
+    this.memoryCache.settings = { ...this.memoryCache.settings, ...settings };
+    if (this.pool && this.isConnected) {
+      await this.pool.query(`
+        UPDATE nexus_gateway_settings 
+        SET settings = $1, updated_at = $2 
+        WHERE id = 'main'
+      `, [JSON.stringify(this.memoryCache.settings), Date.now()]).catch((e: any) => console.error('Error updating settings in DB:', e));
+    }
+  }
+
+  // Database Config
+  public getDbConfig(): DatabaseConfig {
+    return {
+      ...this.memoryCache.dbConfig,
+      connected: this.isConnected,
+      error: this.connectionError || undefined
+    };
+  }
+
+  // Request Logs (Stored in memory and persisted into PostgreSQL)
+  public async addLog(log: RequestLog) {
+    this.memoryCache.requestLogs.unshift(log);
+    if (this.memoryCache.requestLogs.length > 200) {
+      this.memoryCache.requestLogs = this.memoryCache.requestLogs.slice(0, 200);
+    }
+
+    if (this.pool && this.isConnected) {
+      await this.pool.query(`
+        INSERT INTO nexus_request_logs (
+          id, timestamp, client_ip, virtual_key_prefix, requested_model,
+          resolved_provider_id, resolved_provider_name, resolved_model,
+          duration_ms, ttft_ms, status_code, success, fallback_count,
+          fallback_trace, prompt_tokens, completion_tokens, total_tokens,
+          streaming, error_message
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
+      `, [
+        log.id,
+        log.timestamp,
+        log.clientIp || null,
+        log.virtualKeyPrefix || null,
+        log.requestedModel,
+        log.resolvedProviderId,
+        log.resolvedProviderName,
+        log.resolvedModel,
+        log.durationMs,
+        log.ttftMs || null,
+        log.statusCode,
+        log.success,
+        log.fallbackCount,
+        JSON.stringify(log.fallbackTrace || []),
+        log.promptTokens,
+        log.completionTokens,
+        log.totalTokens,
+        log.streaming,
+        log.errorMessage || null
+      ]).catch((e: any) => console.error('Error saving request log to DB:', e.message));
+    }
+  }
+
+  public getLogs(limit = 50): RequestLog[] {
+    return this.memoryCache.requestLogs.slice(0, limit);
+  }
+
+  public async clearLogs() {
+    this.memoryCache.requestLogs = [];
+    if (this.pool && this.isConnected) {
+      await this.pool.query(`TRUNCATE TABLE nexus_request_logs`).catch(() => {});
     }
   }
 }

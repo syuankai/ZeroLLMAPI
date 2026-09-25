@@ -54,8 +54,6 @@ export async function forwardChatCompletion(
 
   switch (provider.type) {
     case 'gemini': {
-      // Google Gemini supports OpenAI-compatible endpoint at /v1beta/openai/chat/completions
-      // Or standard gemini models
       targetUrl = `https://generativelanguage.googleapis.com/v1beta/openai/chat/completions`;
       headers['Authorization'] = `Bearer ${plainApiKey}`;
       break;
@@ -94,7 +92,22 @@ export async function forwardChatCompletion(
     }
 
     case 'huggingface': {
-      targetUrl = `${provider.baseUrl.replace(/\/$/, '')}/v1/chat/completions`;
+      const base = provider.baseUrl?.trim() || 'https://router.huggingface.co/v1';
+      targetUrl = `${base.replace(/\/$/, '')}/chat/completions`;
+      headers['Authorization'] = `Bearer ${plainApiKey}`;
+      break;
+    }
+
+    case 'ollama_cloud': {
+      const base = provider.baseUrl?.trim() || 'https://ollama.com/v1';
+      targetUrl = `${base.replace(/\/$/, '')}/chat/completions`;
+      headers['Authorization'] = `Bearer ${plainApiKey}`;
+      break;
+    }
+
+    case 'agnes': {
+      const base = provider.baseUrl?.trim() || 'https://apihub.agnes-ai.com/v1';
+      targetUrl = `${base.replace(/\/$/, '')}/chat/completions`;
       headers['Authorization'] = `Bearer ${plainApiKey}`;
       break;
     }
@@ -106,18 +119,36 @@ export async function forwardChatCompletion(
     }
 
     case 'cloudflare': {
-      // Cloudflare Workers AI OpenAI-compatible endpoint
-      targetUrl = `${provider.baseUrl.replace(/\/$/, '')}/chat/completions`;
-      headers['Authorization'] = `Bearer ${plainApiKey}`;
+      const base = provider.baseUrl?.trim() || 'https://api.cloudflare.com/client/v4/accounts/ai/v1';
+      targetUrl = base.endsWith('/chat/completions') ? base : `${base.replace(/\/$/, '')}/chat/completions`;
+      if (plainApiKey) {
+        headers['Authorization'] = `Bearer ${plainApiKey}`;
+      }
       break;
     }
 
     case 'custom':
     default: {
-      const base = provider.baseUrl.replace(/\/$/, '');
-      targetUrl = base.endsWith('/chat/completions') ? base : `${base}/chat/completions`;
+      const base = provider.baseUrl.trim().replace(/\/$/, '');
+      if (base.endsWith('/chat/completions')) {
+        targetUrl = base;
+      } else if (base.endsWith('/v1')) {
+        targetUrl = `${base}/chat/completions`;
+      } else {
+        targetUrl = `${base}/chat/completions`;
+      }
+
       if (plainApiKey) {
-        headers['Authorization'] = `Bearer ${plainApiKey}`;
+        if (provider.authHeaderType === 'x-api-key') {
+          headers['x-api-key'] = plainApiKey;
+        } else if (provider.authHeaderType === 'api-key') {
+          headers['api-key'] = plainApiKey;
+        } else if (provider.authHeaderType === 'custom' && provider.customAuthHeaderName) {
+          headers[provider.customAuthHeaderName] = plainApiKey;
+        } else {
+          // Default Bearer
+          headers['Authorization'] = `Bearer ${plainApiKey}`;
+        }
       }
       break;
     }

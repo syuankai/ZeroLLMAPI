@@ -16,7 +16,7 @@ import {
   TelemetryStats, 
   VirtualApiKey 
 } from './types';
-import { CheckCircle2, AlertCircle, X } from 'lucide-react';
+import { CheckCircle2, AlertCircle, X, Database, ArrowRight } from 'lucide-react';
 
 interface Toast {
   id: string;
@@ -46,8 +46,8 @@ export default function App() {
     defaultModel: 'gemini-2.5-flash'
   });
   const [dbConfig, setDbConfig] = useState<DatabaseConfig>({
-    type: 'sqlite-local',
-    connected: true
+    type: 'supabase-direct',
+    connected: false
   });
   const [masterKeyMasked, setMasterKeyMasked] = useState<string>('');
   const [stats, setStats] = useState<TelemetryStats | null>(null);
@@ -82,6 +82,7 @@ export default function App() {
         setIsAuthenticated(data.authenticated || authToken === 'dev-bypass-session');
         setMasterKeyMasked(data.masterKeyMasked || '');
         setSettings((prev) => ({ ...prev, masterKeySet: data.masterKeySet }));
+        setDbConfig((prev) => ({ ...prev, connected: data.dbConnected, error: data.dbError }));
       }
     } catch (err) {
       console.error('Failed to fetch auth status:', err);
@@ -95,6 +96,9 @@ export default function App() {
       if (res.ok) {
         const data = await res.json();
         setProviders(data.providers || []);
+        if (data.dbConnected !== undefined) {
+          setDbConfig((prev) => ({ ...prev, connected: data.dbConnected }));
+        }
       }
     } catch (err) {
       console.error('Failed to load providers:', err);
@@ -148,6 +152,9 @@ export default function App() {
       if (res.ok) {
         const data = await res.json();
         setStats(data);
+        if (data.dbConnected !== undefined) {
+          setDbConfig((prev) => ({ ...prev, connected: data.dbConnected }));
+        }
       }
     } catch (err) {
       console.error('Failed to load stats:', err);
@@ -242,7 +249,7 @@ export default function App() {
       });
       const data = await res.json();
       if (res.ok) {
-        addToast(`提供商「${providerData.name}」已使用 AES-256-GCM 安全加密儲存`);
+        addToast(`提供商「${providerData.name}」已使用 AES-256-GCM 安全加密寫入 Supabase`);
         await fetchProviders();
         await fetchStats();
         return true;
@@ -262,7 +269,7 @@ export default function App() {
         headers: getAuthHeaders()
       });
       if (res.ok) {
-        addToast('提供商已移除');
+        addToast('提供商已從資料庫移除');
         await fetchProviders();
         await fetchStats();
         return true;
@@ -294,7 +301,7 @@ export default function App() {
       const data = await res.json();
       if (res.ok) {
         setSettings(data.settings);
-        addToast('負載平衡策略與熔斷參數已更新');
+        addToast('負載平衡策略與熔斷參數已更新至 Supabase');
         return true;
       }
       addToast(data.error || '更新失敗', 'error');
@@ -317,7 +324,7 @@ export default function App() {
       if (res.ok) {
         await fetchAuthStatus();
         await fetchProviders();
-        addToast('主加密金鑰更新成功！所有 API 金鑰已重新加密');
+        addToast('主加密金鑰更新成功！所有金鑰已於 Supabase 重新加密');
         return { success: true, message: data.message };
       }
       return { success: false, message: data.error || '更新主金鑰失敗' };
@@ -326,52 +333,36 @@ export default function App() {
     }
   };
 
-  // Database Handlers
-  const handleSaveDbConfig = async (configData: Partial<DatabaseConfig> & { restApiKey?: string }) => {
+  // Direct Supabase Database Handlers
+  const handleConnectDatabase = async (config: any) => {
     try {
-      const res = await fetch('/api/database/config', {
+      const res = await fetch('/api/database/connect', {
         method: 'POST',
         headers: getAuthHeaders(),
-        body: JSON.stringify(configData)
+        body: JSON.stringify(config)
       });
       const data = await res.json();
-      if (res.ok) {
-        setDbConfig(data.config);
-        addToast(data.message);
-        return { success: true, message: data.message };
+      if (res.ok && data.success) {
+        setDbConfig(data.config || { type: 'supabase-direct', connected: true });
+        addToast('已成功直連 Supabase 資料庫！資料表已初始化');
+        await fetchProviders();
+        await fetchStats();
+        return { success: true, message: data.message, latencyMs: data.latencyMs };
       }
-      return { success: false, message: data.error || '儲存失敗' };
+      return { success: false, message: data.message || '連線失敗' };
     } catch (err: any) {
       return { success: false, message: err.message };
     }
   };
 
-  const handleTestDbConnection = async (endpoint: string, apiKey?: string, type?: string) => {
+  const handleTestDatabase = async (config: any) => {
     try {
       const res = await fetch('/api/database/test', {
         method: 'POST',
         headers: getAuthHeaders(),
-        body: JSON.stringify({ restEndpoint: endpoint, restApiKey: apiKey, type })
+        body: JSON.stringify(config)
       });
       return await res.json();
-    } catch (err: any) {
-      return { success: false, message: err.message, latencyMs: 0 };
-    }
-  };
-
-  const handleSyncDb = async () => {
-    try {
-      const res = await fetch('/api/database/sync', {
-        method: 'POST',
-        headers: getAuthHeaders()
-      });
-      const data = await res.json();
-      if (res.ok) {
-        await fetchDbConfig();
-        addToast(data.message);
-        return { success: true, message: data.message };
-      }
-      return { success: false, message: data.message || '同步失敗' };
     } catch (err: any) {
       return { success: false, message: err.message };
     }
@@ -391,6 +382,7 @@ export default function App() {
         addToast('虛擬 API 金鑰建立成功');
         return data.rawSecretKey;
       }
+      addToast(data.error || '建立失敗', 'error');
       return null;
     } catch (err: any) {
       addToast(err.message, 'error');
@@ -446,6 +438,27 @@ export default function App() {
         activeProvidersCount={activeProvidersCount}
       />
 
+      {/* Global No-Database Alert Notification Banner */}
+      {!dbConfig.connected && activeTab !== 'database-security' && (
+        <div className="bg-amber-950/60 border-b border-amber-800/80 px-4 py-2.5 text-xs text-amber-200">
+          <div className="max-w-7xl mx-auto flex items-center justify-between gap-3">
+            <div className="flex items-center gap-2">
+              <Database className="w-4 h-4 text-amber-400 shrink-0" />
+              <span>
+                <strong>提醒：</strong>目前尚未連線至 Supabase / PostgreSQL 資料庫。所有功能與網關請求均需真實資料庫連線支援。
+              </span>
+            </div>
+            <button
+              onClick={() => setActiveTab('database-security')}
+              className="px-3 py-1 bg-amber-500 hover:bg-amber-400 text-neutral-950 font-bold rounded flex items-center gap-1 shrink-0 transition-colors"
+            >
+              <span>立即連線 Supabase</span>
+              <ArrowRight className="w-3.5 h-3.5" />
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* Main Content Viewport */}
       <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-6">
         
@@ -467,6 +480,7 @@ export default function App() {
             onDeleteProvider={handleDeleteProvider}
             onTestProvider={handleTestProvider}
             masterKeySet={settings.masterKeySet}
+            dbConnected={dbConfig.connected}
           />
         )}
 
@@ -500,9 +514,8 @@ export default function App() {
             masterKeySet={settings.masterKeySet}
             masterKeyMasked={masterKeyMasked}
             onUpdateMasterKey={handleUpdateMasterKey}
-            onSaveDbConfig={handleSaveDbConfig}
-            onTestDbConnection={handleTestDbConnection}
-            onSyncDb={handleSyncDb}
+            onConnectDatabase={handleConnectDatabase}
+            onTestDatabase={handleTestDatabase}
           />
         )}
 
@@ -518,12 +531,12 @@ export default function App() {
           <div className="flex items-center gap-2">
             <span>EdgeAI Nexus Gateway</span>
             <span aria-hidden="true">·</span>
-            <span>Cloudflare Worker Compatible Edge Proxy</span>
+            <span>Cloudflare Worker & Supabase Real PostgreSQL Engine</span>
           </div>
           <div className="flex items-center gap-3">
-            <span className="font-mono text-[11px]">OpenAI Compatible API /v1</span>
+            <span className="font-mono text-[11px]">OpenAI Compatible /v1</span>
             <span aria-hidden="true">·</span>
-            <span className="text-emerald-500">AES-256-GCM Encrypted at Rest</span>
+            <span className="text-emerald-500">AES-256-GCM Encrypted in Supabase</span>
           </div>
         </div>
       </footer>

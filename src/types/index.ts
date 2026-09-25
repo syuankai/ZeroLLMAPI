@@ -8,7 +8,7 @@ export type LoadBalancingStrategy =
 export interface AIProvider {
   id: string;
   name: string;
-  type: 'gemini' | 'groq' | 'openrouter' | 'mistral' | 'cerebras' | 'deepseek' | 'cloudflare' | 'huggingface' | 'github' | 'custom';
+  type: 'gemini' | 'groq' | 'openrouter' | 'mistral' | 'cerebras' | 'deepseek' | 'cloudflare' | 'huggingface' | 'github' | 'ollama_cloud' | 'agnes' | 'custom';
   baseUrl: string;
   apiKeyMasked?: string;
   hasApiKey?: boolean;
@@ -20,6 +20,9 @@ export interface AIProvider {
   maxTokens?: number;
   rateLimitRpm?: number;
   customHeaders?: Record<string, string>;
+  authHeaderType?: 'Bearer' | 'x-api-key' | 'api-key' | 'custom';
+  customAuthHeaderName?: string;
+  requestBodyFormat?: 'openai-chat' | 'gemini-native' | 'claude-native';
   createdAt: number;
   updatedAt: number;
 }
@@ -54,12 +57,19 @@ export interface VirtualApiKey {
 }
 
 export interface DatabaseConfig {
-  type: 'sqlite-local' | 'postgres-rest' | 'mysql-rest' | 'cloudflare-d1';
+  type: 'supabase-direct' | 'postgres-direct' | 'postgres-rest' | 'mysql-rest';
+  host?: string;
+  port?: number;
+  database?: string;
+  user?: string;
+  password?: string;
+  connectionString?: string;
+  ssl?: boolean;
   restEndpoint?: string;
   restApiKeyMasked?: string;
-  tableNamePrefix?: string;
   connected: boolean;
   lastSyncedAt?: number;
+  error?: string;
 }
 
 export interface GatewaySettings {

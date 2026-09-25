@@ -69,16 +69,17 @@ export const Header: React.FC<HeaderProps> = ({
               EdgeAI Nexus Gateway
             </span>
             <div className="flex items-center gap-1.5 text-xs text-neutral-400 font-mono">
-              <span className={activeProvidersCount > 0 ? 'text-emerald-400' : 'text-neutral-500'}>
+              <span className={activeProvidersCount > 0 ? 'text-emerald-400 font-semibold' : 'text-neutral-500'}>
                 {activeProvidersCount} 線上提供商
               </span>
               <span aria-hidden="true" className="text-neutral-600">·</span>
-              <span className={masterKeySet ? 'text-cyan-400' : 'text-amber-400'}>
-                {masterKeySet ? 'AES-256-GCM 已鎖定' : '預設金鑰'}
+              <span className={masterKeySet ? 'text-cyan-400 font-medium' : 'text-amber-400'}>
+                {masterKeySet ? 'AES-256-GCM 已鎖定' : '預設主金鑰'}
               </span>
               <span aria-hidden="true" className="text-neutral-600">·</span>
-              <span className={dbConnected ? 'text-emerald-400' : 'text-neutral-500'}>
-                {dbConnected ? 'REST 資料庫連線中' : '本機存儲'}
+              <span className={dbConnected ? 'text-emerald-400 font-semibold flex items-center gap-1' : 'text-red-400 font-semibold'}>
+                <span className={`w-1.5 h-1.5 rounded-full ${dbConnected ? 'bg-emerald-400 animate-pulse' : 'bg-red-400'}`} />
+                {dbConnected ? 'Supabase 直連已就緒' : '資料庫未連線'}
               </span>
             </div>
           </div>
